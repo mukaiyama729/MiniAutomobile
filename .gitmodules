@@ -1,0 +1,3 @@
+[submodule "firmwares"]
+	path = firmwares
+	url = https://github.com/mukaiyama729/Firmwares.git
