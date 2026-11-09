@@ -1,0 +1,21 @@
+# Future config schema, not parsed by robot-cli yet.
+# Each physical device has an independent driver. The manager does not carry image/pointcloud streams.
+devices:
+  - id: motor-left
+    kind: motor
+    driver: pico_usb
+    connection:
+      type: usb_serial
+      path: /dev/serial/by-id/usb-Robot_Rust_Pico2_Motor_PICO2-MOTOR-001-if00
+  - id: lidar-front
+    kind: lidar
+    driver: ros2_external
+    connection:
+      type: ros2
+      pointcloud_topic: /sensing/lidar/front/points
+  - id: camera-front
+    kind: camera
+    driver: ros2_external
+    connection:
+      type: ros2
+      image_topic: /sensing/camera/front/image_raw

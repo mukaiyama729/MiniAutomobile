@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+/firmware/pico-motor/target/
+
+# Rust editor backup files
+**/*.rs.bk
+
+# ROS 2 / colcon generated files
+/ros2_ws/build/
+/ros2_ws/install/
+/ros2_ws/log/
+
+# Editor and operating system files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

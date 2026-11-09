@@ -1,0 +1,9 @@
+[package]
+name = "robot-cli"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+robot-domain = { path = "../../crates/robot-domain" }
+robot-application = { path = "../../crates/robot-application" }
+robot-device-manager = { path = "../../crates/robot-device-manager" }
+adapter-pico-usb = { path = "../../crates/adapter-pico-usb" }
