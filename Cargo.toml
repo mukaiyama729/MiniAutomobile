@@ -8,4 +8,4 @@ members = [
   "crates/adapter-pico-usb",
   "apps/robot-cli",
 ]
-exclude = ["firmware/pico-motor"]
+exclude = ["firmwares/pico-motor"]

@@ -11,11 +11,20 @@ controlling one **28BYJ-48 through ULN2003** and an Ubuntu controller written in
 - `crates/robot-protocol`: shared `#![no_std]` newline protocol
 - `crates/adapter-pico-usb`: USB serial worker + periodic heartbeat
 - `apps/robot-cli`: current inbound command adapter
-- `firmware/pico-motor`: RP2350 firmware (separate embedded Cargo workspace)
+- `firmwares/pico-motor`: RP2350 firmware (separate embedded Cargo workspace)
 - `config/devices.example.yaml`: future configuration example (not loaded yet)
 - `ros2_ws/`: future ROS 2/Autoware integration
 
 See `docs/architecture.md` for constraints and planned expansion.
+
+## Initialize submodules
+
+After cloning this repository, initialize its nested firmware and protocol
+repositories:
+
+```sh
+git submodule update --init --recursive
+```
 
 ## Hardware and wiring
 
@@ -42,7 +51,7 @@ Install current Rust and Pico 2 target:
 ```sh
 rustup target add thumbv8m.main-none-eabihf
 cargo install --locked probe-rs-tools
-cd firmware/pico-motor
+cd firmwares/pico-motor
 cargo run --release
 ```
 
