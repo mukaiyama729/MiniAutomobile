@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          token: ${{ secrets.ROBOT_SUBMODULES_TOKEN || github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - name: Test Linux workspace
+        run: cargo test --workspace --locked
+      - name: Build Pico 2 firmware
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/robot-adapter/firmware/pico-motor/Cargo.toml
+          --target thumbv8m.main-none-eabihf

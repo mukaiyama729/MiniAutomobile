@@ -1,0 +1,52 @@
+name: Update submodules
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+  repository_dispatch:
+    types:
+      - robot-protocol-updated
+      - robot-firmware-updated
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-robot-submodules
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          token: ${{ secrets.ROBOT_SUBMODULES_TOKEN || github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+      - name: Advance submodules to their configured branches
+        run: >-
+          git submodule update --remote --checkout --
+          crates/robot-adapter/protocol crates/robot-adapter/firmware
+      - name: Test Linux workspace
+        run: cargo test --workspace
+      - name: Build Pico 2 firmware
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/robot-adapter/firmware/pico-motor/Cargo.toml
+          --target thumbv8m.main-none-eabihf
+      - name: Create update pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: automation/update-robot-submodules
+          delete-branch: true
+          title: "Update robot protocol and firmware submodules"
+          commit-message: "Update robot protocol and firmware submodules"
+          body: |
+            Updates the pinned robot-protocol and robot-firmware commits.
+
+            Host workspace tests and the Pico 2 firmware cross-build passed in this workflow.

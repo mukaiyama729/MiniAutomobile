@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/robot-protocol",
+  "crates/robot-adapter/protocol",
   "crates/robot-domain",
   "crates/robot-application",
   "crates/robot-device-manager",
-  "crates/adapter-pico-usb",
+  "crates/robot-adapter/drivers/pico-usb",
   "apps/robot-cli",
 ]
-exclude = ["firmwares/pico-motor"]
+exclude = ["crates/robot-adapter/firmware/pico-motor"]

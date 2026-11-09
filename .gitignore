@@ -1,14 +1,14 @@
 # Rust build artifacts
 /target/
-/firmware/pico-motor/target/
+/crates/robot-adapter/firmware/pico-motor/target/
 
 # Rust editor backup files
 **/*.rs.bk
 
 # ROS 2 / colcon generated files
-/ros2_ws/build/
-/ros2_ws/install/
-/ros2_ws/log/
+/crates/robot-adapter/bridges/ros2/build/
+/crates/robot-adapter/bridges/ros2/install/
+/crates/robot-adapter/bridges/ros2/log/
 
 # Editor and operating system files
 *.swp

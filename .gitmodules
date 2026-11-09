@@ -1,6 +1,8 @@
 [submodule "firmwares"]
-	path = firmwares
+	path = crates/robot-adapter/firmware
 	url = https://github.com/mukaiyama729/Firmwares.git
+	branch = main
 [submodule "crates/robot-protocol"]
-	path = crates/robot-protocol
+	path = crates/robot-adapter/protocol
 	url = https://github.com/mukaiyama729/robot-protocol.git
+	branch = main
