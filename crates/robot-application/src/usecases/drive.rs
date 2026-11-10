@@ -2,6 +2,7 @@ use crate::{
     coordination::CommandGateway,
     ports::{inbound::DriveControl, outbound::ControlError},
 };
+use async_trait::async_trait;
 use robot_domain::{
     CommandProposal, CommandSource, ControlLease, ControlMode, Direction, MotionCommand,
     MotionState, ResourceId,
@@ -27,7 +28,7 @@ impl DriveUseCase {
         }
     }
 
-    fn propose(
+    async fn propose(
         &self,
         lease: ControlLease,
         command: MotionCommand,
@@ -43,16 +44,19 @@ impl DriveUseCase {
             valid_until: lease.expires_at,
             control_lease_id: Some(lease.id),
         };
-        self.gateway.submit(proposal)
+        self.gateway.submit(proposal).await
     }
 }
 
+#[async_trait]
 impl DriveControl for DriveUseCase {
-    fn acquire_control(&self, ttl: Duration) -> Result<ControlLease, ControlError> {
-        self.gateway.acquire_control(self.source, self.mode, ttl)
+    async fn acquire_control(&self, ttl: Duration) -> Result<ControlLease, ControlError> {
+        self.gateway
+            .acquire_control(self.source, self.mode, ttl)
+            .await
     }
 
-    fn renew_control(
+    async fn renew_control(
         &self,
         lease: ControlLease,
         ttl: Duration,
@@ -60,37 +64,38 @@ impl DriveControl for DriveUseCase {
         if lease.owner != self.source {
             return Err(ControlError::InvalidLease);
         }
-        self.gateway.renew_control(lease, ttl)
+        self.gateway.renew_control(lease, ttl).await
     }
 
-    fn release_control(&self, lease: ControlLease) -> Result<(), ControlError> {
+    async fn release_control(&self, lease: ControlLease) -> Result<(), ControlError> {
         if lease.owner != self.source {
             return Err(ControlError::InvalidLease);
         }
-        self.gateway.release_control(lease)
+        self.gateway.release_control(lease).await
     }
 
-    fn drive(
+    async fn drive(
         &self,
         lease: ControlLease,
         direction: Direction,
     ) -> Result<MotionState, ControlError> {
         self.propose(lease, MotionCommand::SetDirection(direction))
+            .await
     }
 
-    fn stop(&self, lease: ControlLease) -> Result<MotionState, ControlError> {
-        self.propose(lease, MotionCommand::Stop)
+    async fn stop(&self, lease: ControlLease) -> Result<MotionState, ControlError> {
+        self.propose(lease, MotionCommand::Stop).await
     }
 
-    fn emergency_stop(&self, reason: String) -> Result<MotionState, ControlError> {
-        self.gateway.emergency_stop(reason)
+    async fn emergency_stop(&self, reason: String) -> Result<MotionState, ControlError> {
+        self.gateway.emergency_stop(reason).await
     }
 
-    fn reset_safety_stop(&self) -> Result<(), ControlError> {
-        self.gateway.reset_safety_stop()
+    async fn reset_safety_stop(&self) -> Result<(), ControlError> {
+        self.gateway.reset_safety_stop().await
     }
 
-    fn status(&self) -> Result<MotionState, ControlError> {
-        self.gateway.status()
+    async fn status(&self) -> Result<MotionState, ControlError> {
+        self.gateway.status().await
     }
 }

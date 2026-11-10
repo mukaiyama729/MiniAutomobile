@@ -3,4 +3,6 @@ name = "robot-application"
 version = "0.1.0"
 edition = "2024"
 [dependencies]
+async-trait.workspace = true
 robot-domain = { path = "../robot-domain" }
+tokio.workspace = true

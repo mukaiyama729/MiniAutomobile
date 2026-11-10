@@ -12,6 +12,7 @@ CLI input adapter
   -> DriveControl inbound port
   -> DriveUseCase
   -> CommandGateway
+       -> bounded async request queue + serial coordinator task
        -> ResourceArbiter (mode, source, lease, validity, safety)
        -> device health check
        -> MotorPort outbound port
@@ -33,19 +34,23 @@ CLI input reader -> SafetySupervisor -> safety latch + SafeStop mode
                                       -> PicoUsbMotor urgent STOP
 ```
 
-The input reader starts the emergency-stop path as soon as it reads `e`, even
-if the main CLI loop is waiting for a status or motion reply. The application
-latch is set before the driver waits for the device acknowledgement. The USB
-worker checks the stop latch while waiting for replies, gives STOP priority
-over queued ordinary jobs, and rejects status/heartbeat work while latched.
+The async input reader starts the emergency-stop request as soon as it reads
+`e`, even if the CLI is waiting for a status or motion reply. The application
+latch is set before the driver awaits the device acknowledgement.
+The USB worker checks the stop latch while waiting for replies, gives STOP
+priority over queued ordinary jobs, and rejects status/heartbeat work while
+latched.
 
 ## Dependency boundaries
 
 - `robot-domain` defines hardware- and middleware-independent motion, control,
   lease, resource, proposal, health, and safety types.
-- `robot-application` defines inbound/outbound ports, `DriveUseCase`, the
-  `CommandGateway`, `ResourceArbiter`, and `SafetySupervisor`. Application code
-  does not depend on USB, ROS 2, or Pico implementation details.
+- `robot-application` defines async inbound/outbound I/O ports, `DriveUseCase`,
+  the `CommandGateway`, `ResourceArbiter`, and `SafetySupervisor`. A bounded
+  coordinator task owns each accepted ordinary request through its state
+  update or safety response, even if the caller drops its response future.
+  Emergency stop bypasses that queue. Application code does not depend on USB,
+  ROS 2, or Pico implementation details.
 - `robot-state` implements the application state ports. It stores motion,
   control ownership, and safety independently, with a versioned consistent
   snapshot and narrow writer handles.
@@ -57,7 +62,7 @@ over queued ordinary jobs, and rejects status/heartbeat work while latched.
 - `crates/robot-adapter/protocol` and `crates/robot-adapter/firmware` are
   independent Git submodules. The Linux workspace excludes the embedded
   firmware workspace.
-- `apps/robot-cli` is the current composition root: it creates concrete
+- `apps/robot-cli` is the current Tokio composition root: it creates concrete
   adapters, state storage, device management, use case, and the CLI.
 
 The intended dependency direction is:
@@ -110,11 +115,14 @@ and renews it every 250 ms. Expiry causes the USB worker to send STOP before
 processing the next queued job. An expired lease cannot be renewed with its
 old ID; reacquiring control creates a new ID.
 
-`DriveUseCase` creates proposals rather than touching the motor. `CommandGateway`
-serializes ordinary operations, checks device health, and forwards an
-authorized command through `MotorPort`. Future actuators should define useful
-logical resources such as `DriveBase` or `RobotArm`, not necessarily one
-resource per physical motor.
+`DriveUseCase` creates proposals rather than touching the motor. The async
+`CommandGateway` accepts ordinary operations through a bounded queue, checks
+device health, and forwards one authorized operation at a time through
+`MotorPort`. Awaiting a response yields the caller's executor while the
+coordinator owns the request. Future ROS 2 callbacks should enqueue work and
+return instead of blocking while waiting for a device acknowledgement. Future
+actuators should define useful logical resources such as `DriveBase` or
+`RobotArm`, not necessarily one resource per physical motor.
 
 An active lease is never returned again by `acquire_control`, even to the
 same logical source. A caller must present the latest `ControlLease` returned
@@ -151,9 +159,10 @@ The safety responsibilities are distinct:
 - `SafetySupervisor` latches emergency stop, forces `SafeStop`, and requires
   healthy device status plus a fresh STOP acknowledgement reporting `Stopped`
   before an explicit reset.
-- `PicoUsbMotor` prioritizes STOP, cancels ordinary serial exchanges when a
-  stop arrives, enforces lease deadlines locally, and ceases background
-  watchdog traffic after a lease ends.
+- `PicoUsbMotor` exposes async request/response methods. Its blocking
+  `serialport` I/O stays on one dedicated worker thread, which prioritizes
+  STOP, cancels ordinary serial exchanges when a stop arrives, enforces lease
+  deadlines locally, and ceases background watchdog traffic after a lease ends.
 - Pico firmware has a 1.5-second watchdog. Its current implementation refreshes
   the watchdog on every valid request, including STATUS and PING. The host
   driver therefore re-sends the active direction while a lease is valid and

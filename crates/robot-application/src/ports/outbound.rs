@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use robot_domain::{ControlState, Health, MotionCommand, MotionState, SafetyState, StateSnapshot};
 use std::{error::Error, fmt, time::Instant};
 
@@ -16,6 +17,8 @@ pub enum ControlError {
     InvalidLease,
     InvalidDuration,
     StateConflict,
+    CommandQueueFull,
+    CoordinatorUnavailable,
     Transport(String),
 }
 
@@ -35,6 +38,8 @@ impl fmt::Display for ControlError {
             Self::InvalidLease => write!(f, "control lease is invalid"),
             Self::InvalidDuration => write!(f, "duration must be positive and representable"),
             Self::StateConflict => write!(f, "robot state changed while processing the request"),
+            Self::CommandQueueFull => write!(f, "command coordinator queue is full"),
+            Self::CoordinatorUnavailable => write!(f, "command coordinator is unavailable"),
             Self::Transport(s) => write!(f, "transport error: {s}"),
         }
     }
@@ -45,23 +50,24 @@ impl Error for ControlError {}
 /// Outbound port for a motion device. A successful `stop` or
 /// `emergency_stop` must include a fresh acknowledgement that the device is
 /// stopped; an acknowledgement with a moving state is an error.
+#[async_trait]
 pub trait MotorPort: Send + Sync {
-    fn command(
+    async fn command(
         &self,
         command: MotionCommand,
         lease_id: u64,
         valid_until: Instant,
     ) -> Result<MotionState, ControlError>;
 
-    fn renew_lease(&self, lease_id: u64, valid_until: Instant) -> Result<(), ControlError>;
+    async fn renew_lease(&self, lease_id: u64, valid_until: Instant) -> Result<(), ControlError>;
 
     /// Sends STOP and confirms the returned device state before succeeding.
-    fn stop(&self) -> Result<MotionState, ControlError>;
+    async fn stop(&self) -> Result<MotionState, ControlError>;
 
     /// Latches the adapter's stop state and confirms a fresh STOP response.
-    fn emergency_stop(&self) -> Result<MotionState, ControlError>;
-    fn clear_emergency_stop(&self) -> Result<(), ControlError>;
-    fn read_state(&self) -> Result<MotionState, ControlError>;
+    async fn emergency_stop(&self) -> Result<MotionState, ControlError>;
+    async fn clear_emergency_stop(&self) -> Result<(), ControlError>;
+    async fn read_state(&self) -> Result<MotionState, ControlError>;
 }
 
 pub trait RobotStateReader: Send + Sync {

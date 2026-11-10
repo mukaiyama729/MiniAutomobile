@@ -5,6 +5,7 @@
 //! moving and PINGing while stopped. On expiry it sends STOP and ceases
 //! background watchdog traffic.
 
+use async_trait::async_trait;
 use robot_application::ports::outbound::{ControlError, MotorPort};
 use robot_device_manager::Device;
 use robot_domain::{Capability, Health, MotionCommand, MotionState};
@@ -19,6 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tokio::{sync::oneshot, time::timeout};
 
 const HEARTBEAT: Duration = Duration::from_millis(300);
 const ACK_TIMEOUT: Duration = Duration::from_millis(650);
@@ -26,8 +28,18 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_WAIT: Duration = Duration::from_secs(86_400);
 const CAPABILITIES: &[Capability] = &[Capability::Motor];
 
-type MotionReply = mpsc::Sender<Result<MotionState, ControlError>>;
-type UnitReply = mpsc::Sender<Result<(), ControlError>>;
+type MotionReply = oneshot::Sender<Result<MotionState, ControlError>>;
+type UnitReply = oneshot::Sender<Result<(), ControlError>>;
+
+struct CancelOnDrop(Option<Arc<AtomicBool>>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancelled) = &self.0 {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
 
 enum Job {
     Command {
@@ -67,8 +79,15 @@ pub struct PicoUsbMotor {
 }
 
 impl PicoUsbMotor {
-    pub fn connect(id: impl Into<String>, path: &str) -> Result<Self, ControlError> {
+    pub async fn connect(id: impl Into<String>, path: &str) -> Result<Self, ControlError> {
         let id = id.into();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::connect_blocking(id, path))
+            .await
+            .map_err(|error| ControlError::Transport(error.to_string()))?
+    }
+
+    fn connect_blocking(id: String, path: String) -> Result<Self, ControlError> {
         let mut port = serialport::new(path, 115_200)
             .timeout(Duration::from_millis(50))
             .open()
@@ -111,41 +130,33 @@ impl PicoUsbMotor {
         })
     }
 
-    fn wait_motion(
+    async fn wait_motion(
         &self,
-        receiver: mpsc::Receiver<Result<MotionState, ControlError>>,
-        cancelled: Option<&AtomicBool>,
+        receiver: oneshot::Receiver<Result<MotionState, ControlError>>,
+        cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<MotionState, ControlError> {
-        match receiver.recv_timeout(CALL_TIMEOUT) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(cancelled) = cancelled {
-                    cancelled.store(true, Ordering::Release);
-                }
-                Err(ControlError::Timeout)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ControlError::Disconnected),
+        let _cancel_on_drop = CancelOnDrop(cancelled);
+        match timeout(CALL_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ControlError::Disconnected),
+            Err(_) => Err(ControlError::Timeout),
         }
     }
 
-    fn wait_unit(
+    async fn wait_unit(
         &self,
-        receiver: mpsc::Receiver<Result<(), ControlError>>,
-        cancelled: Option<&AtomicBool>,
+        receiver: oneshot::Receiver<Result<(), ControlError>>,
+        cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<(), ControlError> {
-        match receiver.recv_timeout(CALL_TIMEOUT) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(cancelled) = cancelled {
-                    cancelled.store(true, Ordering::Release);
-                }
-                Err(ControlError::Timeout)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ControlError::Disconnected),
+        let _cancel_on_drop = CancelOnDrop(cancelled);
+        match timeout(CALL_TIMEOUT, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ControlError::Disconnected),
+            Err(_) => Err(ControlError::Timeout),
         }
     }
 
-    fn request_motion(
+    async fn request_motion(
         &self,
         command: Command,
         lease_id: u64,
@@ -155,7 +166,7 @@ impl PicoUsbMotor {
             return Err(ControlError::Unsafe);
         }
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::Command {
                 command,
@@ -165,20 +176,21 @@ impl PicoUsbMotor {
                 reply,
             })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_motion(receiver, Some(&cancelled))
+        self.wait_motion(receiver, Some(cancelled)).await
     }
 
-    fn request_stop(&self) -> Result<MotionState, ControlError> {
-        let (reply, receiver) = mpsc::channel();
+    async fn request_stop(&self) -> Result<MotionState, ControlError> {
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::Stop { reply })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_motion(receiver, None)
+        self.wait_motion(receiver, None).await
     }
 }
 
+#[async_trait]
 impl MotorPort for PicoUsbMotor {
-    fn command(
+    async fn command(
         &self,
         command: MotionCommand,
         lease_id: u64,
@@ -190,14 +202,15 @@ impl MotorPort for PicoUsbMotor {
             MotionCommand::Stop => Command::Stop,
         };
         self.request_motion(wire_command, lease_id, valid_until)
+            .await
     }
 
-    fn renew_lease(&self, lease_id: u64, valid_until: Instant) -> Result<(), ControlError> {
+    async fn renew_lease(&self, lease_id: u64, valid_until: Instant) -> Result<(), ControlError> {
         if is_latched(&self.stop_generation) {
             return Err(ControlError::Unsafe);
         }
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::RenewLease {
                 lease_id,
@@ -206,29 +219,29 @@ impl MotorPort for PicoUsbMotor {
                 reply,
             })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_unit(receiver, Some(&cancelled))
+        self.wait_unit(receiver, Some(cancelled)).await
     }
 
-    fn stop(&self) -> Result<MotionState, ControlError> {
-        self.request_stop()
+    async fn stop(&self) -> Result<MotionState, ControlError> {
+        self.request_stop().await
     }
 
-    fn emergency_stop(&self) -> Result<MotionState, ControlError> {
+    async fn emergency_stop(&self) -> Result<MotionState, ControlError> {
         latch_stop(&self.stop_generation);
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::EmergencyStop { reply })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_motion(receiver, None)
+        self.wait_motion(receiver, None).await
     }
 
-    fn clear_emergency_stop(&self) -> Result<(), ControlError> {
+    async fn clear_emergency_stop(&self) -> Result<(), ControlError> {
         let generation = self.stop_generation.load(Ordering::Acquire);
         if generation & 1 == 0 {
             return Err(ControlError::Rejected);
         }
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::ClearEmergencyStop {
                 generation,
@@ -236,19 +249,19 @@ impl MotorPort for PicoUsbMotor {
                 reply,
             })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_unit(receiver, Some(&cancelled))?;
+        self.wait_unit(receiver, Some(cancelled)).await?;
         if self.stop_generation.load(Ordering::Acquire) != generation.wrapping_add(1) {
             return Err(ControlError::Unsafe);
         }
         Ok(())
     }
 
-    fn read_state(&self) -> Result<MotionState, ControlError> {
-        let (reply, receiver) = mpsc::channel();
+    async fn read_state(&self) -> Result<MotionState, ControlError> {
+        let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::ReadState { reply })
             .map_err(|_| ControlError::Disconnected)?;
-        self.wait_motion(receiver, None)
+        self.wait_motion(receiver, None).await
     }
 }
 

@@ -38,10 +38,10 @@ impl SafetySupervisor {
         }
     }
 
-    pub fn emergency_stop(&self, reason: String) -> Result<MotionState, ControlError> {
+    pub async fn emergency_stop(&self, reason: String) -> Result<MotionState, ControlError> {
         let latched = self.safety_writer.latch(reason);
         self.control_writer.force_safe_stop();
-        match self.motor.emergency_stop() {
+        match self.motor.emergency_stop().await {
             Ok(state) => {
                 self.motion_writer
                     .report_motion_if_safety_latched(state, latched.generation);
@@ -55,7 +55,7 @@ impl SafetySupervisor {
         }
     }
 
-    pub fn reset(&self) -> Result<(), ControlError> {
+    pub async fn reset(&self) -> Result<(), ControlError> {
         let snapshot = self.state_reader.snapshot();
         if !snapshot.safety.latched {
             return Err(ControlError::Rejected);
@@ -73,16 +73,16 @@ impl SafetySupervisor {
             }
         }
 
-        if self.motor.stop()? != MotionState::Stopped {
+        if self.motor.stop().await? != MotionState::Stopped {
             return Err(ControlError::Unsafe);
         }
 
-        self.motor.clear_emergency_stop()?;
+        self.motor.clear_emergency_stop().await?;
         if !self
             .safety_writer
             .clear_if_generation(snapshot.safety.generation)
         {
-            let _ = self.motor.emergency_stop();
+            let _ = self.motor.emergency_stop().await;
             return Err(ControlError::Unsafe);
         }
 
@@ -95,7 +95,7 @@ impl SafetySupervisor {
             .compare_and_set(safe_control, ControlState::default())
         {
             if self.state_reader.snapshot().safety.latched {
-                let _ = self.motor.emergency_stop();
+                let _ = self.motor.emergency_stop().await;
                 self.control_writer.force_safe_stop();
                 return Err(ControlError::Unsafe);
             }
@@ -105,7 +105,7 @@ impl SafetySupervisor {
         // A new stop can arrive while the hardware latch is being reset.
         // Reassert the device latch if that happened during this operation.
         if self.state_reader.snapshot().safety.latched {
-            let _ = self.motor.emergency_stop();
+            let _ = self.motor.emergency_stop().await;
             self.control_writer.force_safe_stop();
             return Err(ControlError::Unsafe);
         }
@@ -114,7 +114,7 @@ impl SafetySupervisor {
             .motion_writer
             .report_motion_if_safety_clear(MotionState::Stopped, snapshot.safety.generation)
         {
-            let _ = self.motor.emergency_stop();
+            let _ = self.motor.emergency_stop().await;
             self.control_writer.force_safe_stop();
             return Err(ControlError::Unsafe);
         }
