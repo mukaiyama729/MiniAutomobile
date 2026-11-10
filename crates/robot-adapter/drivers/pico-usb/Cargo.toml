@@ -8,5 +8,5 @@ robot-protocol = { path = "../../protocol" }
 robot-domain = { path = "../../../robot-domain" }
 robot-application = { path = "../../../robot-application" }
 robot-device-manager = { path = "../../../robot-device-manager" }
-serialport = { version = "4.8", default-features = false }
+tokio-serial = "5.5"
 tokio.workspace = true

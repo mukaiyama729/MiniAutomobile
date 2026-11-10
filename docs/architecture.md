@@ -57,8 +57,8 @@ latched.
 - `robot-device-manager` registers devices and exposes their health through an
   application port.
 - `crates/robot-adapter/drivers/pico-usb` implements the motor port and owns
-  the serial worker. Other drivers and reusable transports belong under
-  `crates/robot-adapter` when implemented.
+  the async serial worker task. Other drivers and reusable transports belong
+  under `crates/robot-adapter` when implemented.
 - `crates/robot-adapter/protocol` and `crates/robot-adapter/firmware` are
   independent Git submodules. The Linux workspace excludes the embedded
   firmware workspace.
@@ -159,10 +159,11 @@ The safety responsibilities are distinct:
 - `SafetySupervisor` latches emergency stop, forces `SafeStop`, and requires
   healthy device status plus a fresh STOP acknowledgement reporting `Stopped`
   before an explicit reset.
-- `PicoUsbMotor` exposes async request/response methods. Its blocking
-  `serialport` I/O stays on one dedicated worker thread, which prioritizes
-  STOP, cancels ordinary serial exchanges when a stop arrives, enforces lease
-  deadlines locally, and ceases background watchdog traffic after a lease ends.
+- `PicoUsbMotor` exposes async request/response methods. Its `tokio-serial`
+  stream is owned by one Tokio task, which prioritizes STOP, cancels ordinary
+  serial exchanges when a stop arrives, enforces lease deadlines locally, and
+  ceases background watchdog traffic after a lease ends. The crate's synchronous
+  port-open call is isolated with `spawn_blocking`.
 - Pico firmware has a 1.5-second command timeout, refreshed by every valid
   request including STATUS and PING. A separate RP2350 hardware watchdog is
   fed after each completed main-loop iteration and resets the MCU if that loop

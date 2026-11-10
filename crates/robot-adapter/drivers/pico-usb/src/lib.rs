@@ -10,33 +10,67 @@ use robot_application::ports::outbound::{ControlError, MotorPort};
 use robot_device_manager::Device;
 use robot_domain::{Capability, Health, MotionCommand, MotionState};
 use robot_protocol::{self as protocol, Command, Request, Response};
-use serialport::SerialPort;
 use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
     },
-    thread,
     time::{Duration, Instant},
 };
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{Notify, mpsc, oneshot},
+    time::timeout,
+};
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 const HEARTBEAT: Duration = Duration::from_millis(300);
 const ACK_TIMEOUT: Duration = Duration::from_millis(650);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
-const IDLE_WAIT: Duration = Duration::from_secs(86_400);
 const CAPABILITIES: &[Capability] = &[Capability::Motor];
 
 type MotionReply = oneshot::Sender<Result<MotionState, ControlError>>;
 type UnitReply = oneshot::Sender<Result<(), ControlError>>;
 
-struct CancelOnDrop(Option<Arc<AtomicBool>>);
+struct Cancellation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl Cancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+struct CancelOnDrop(Option<Arc<Cancellation>>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(cancelled) = &self.0 {
-            cancelled.store(true, Ordering::Release);
+            cancelled.cancel();
         }
     }
 }
@@ -46,13 +80,13 @@ enum Job {
         command: Command,
         lease_id: u64,
         valid_until: Instant,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<Cancellation>,
         reply: MotionReply,
     },
     RenewLease {
         lease_id: u64,
         valid_until: Instant,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<Cancellation>,
         reply: UnitReply,
     },
     Stop {
@@ -63,7 +97,7 @@ enum Job {
     },
     ClearEmergencyStop {
         generation: u64,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<Cancellation>,
         reply: UnitReply,
     },
     ReadState {
@@ -73,67 +107,71 @@ enum Job {
 
 pub struct PicoUsbMotor {
     id: String,
-    tx: mpsc::Sender<Job>,
+    tx: mpsc::UnboundedSender<Job>,
     health: Arc<Mutex<Health>>,
     stop_generation: Arc<AtomicU64>,
+    stop_notify: Arc<Notify>,
 }
 
 impl PicoUsbMotor {
     pub async fn connect(id: impl Into<String>, path: &str) -> Result<Self, ControlError> {
         let id = id.into();
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || Self::connect_blocking(id, path))
-            .await
-            .map_err(|error| ControlError::Transport(error.to_string()))?
-    }
-
-    fn connect_blocking(id: String, path: String) -> Result<Self, ControlError> {
-        let mut port = serialport::new(path, 115_200)
-            .timeout(Duration::from_millis(50))
-            .open()
-            .map_err(|e| ControlError::Transport(e.to_string()))?;
+        // Port opening is synchronous in tokio-serial; keep it off the runtime
+        // worker while all serial reads and writes remain async.
+        let mut port = tokio::task::spawn_blocking(move || {
+            tokio_serial::new(path, 115_200).open_native_async()
+        })
+        .await
+        .map_err(|error| ControlError::Transport(error.to_string()))?
+        .map_err(|error| ControlError::Transport(error.to_string()))?;
 
         let stop_generation = Arc::new(AtomicU64::new(0));
+        let stop_notify = Arc::new(Notify::new());
         let mut sequence = 1;
         // Establish that the controller is responding and start from a known
         // stopped state before exposing the adapter to application code.
         let initial_state = exchange_next(
-            port.as_mut(),
+            &mut port,
             &mut sequence,
             Command::Stop,
             &stop_generation,
+            &stop_notify,
             None,
             None,
-        )?;
+        )
+        .await?;
         if initial_state != MotionState::Stopped {
             return Err(ControlError::Rejected);
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         let health = Arc::new(Mutex::new(Health::Ready));
         let worker_health = Arc::clone(&health);
         let worker_stop_generation = Arc::clone(&stop_generation);
-        thread::Builder::new()
-            .name(format!("pico-usb-{id}"))
-            .spawn(move || {
-                // `id` is copied into the thread name above; no device identity
-                // is required by the serial worker itself.
-                serial_worker(port, rx, worker_health, worker_stop_generation, sequence)
-            })
-            .map_err(|e| ControlError::Transport(e.to_string()))?;
+        let worker_stop_notify = Arc::clone(&stop_notify);
+        tokio::spawn(serial_worker(
+            port,
+            rx,
+            worker_health,
+            worker_stop_generation,
+            worker_stop_notify,
+            sequence,
+        ));
 
         Ok(Self {
             id,
             tx,
             health,
             stop_generation,
+            stop_notify,
         })
     }
 
     async fn wait_motion(
         &self,
         receiver: oneshot::Receiver<Result<MotionState, ControlError>>,
-        cancelled: Option<Arc<AtomicBool>>,
+        cancelled: Option<Arc<Cancellation>>,
     ) -> Result<MotionState, ControlError> {
         let _cancel_on_drop = CancelOnDrop(cancelled);
         match timeout(CALL_TIMEOUT, receiver).await {
@@ -146,7 +184,7 @@ impl PicoUsbMotor {
     async fn wait_unit(
         &self,
         receiver: oneshot::Receiver<Result<(), ControlError>>,
-        cancelled: Option<Arc<AtomicBool>>,
+        cancelled: Option<Arc<Cancellation>>,
     ) -> Result<(), ControlError> {
         let _cancel_on_drop = CancelOnDrop(cancelled);
         match timeout(CALL_TIMEOUT, receiver).await {
@@ -165,7 +203,7 @@ impl PicoUsbMotor {
         if is_latched(&self.stop_generation) && command != Command::Stop {
             return Err(ControlError::Unsafe);
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(Cancellation::new());
         let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::Command {
@@ -209,7 +247,7 @@ impl MotorPort for PicoUsbMotor {
         if is_latched(&self.stop_generation) {
             return Err(ControlError::Unsafe);
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(Cancellation::new());
         let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::RenewLease {
@@ -227,7 +265,7 @@ impl MotorPort for PicoUsbMotor {
     }
 
     async fn emergency_stop(&self) -> Result<MotionState, ControlError> {
-        latch_stop(&self.stop_generation);
+        latch_stop(&self.stop_generation, &self.stop_notify);
         let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::EmergencyStop { reply })
@@ -240,7 +278,7 @@ impl MotorPort for PicoUsbMotor {
         if generation & 1 == 0 {
             return Err(ControlError::Rejected);
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(Cancellation::new());
         let (reply, receiver) = oneshot::channel();
         self.tx
             .send(Job::ClearEmergencyStop {
@@ -289,11 +327,12 @@ struct ActiveLease {
     motion: Option<Command>,
 }
 
-fn serial_worker(
-    mut port: Box<dyn SerialPort>,
-    rx: mpsc::Receiver<Job>,
+async fn serial_worker(
+    mut port: SerialStream,
+    mut rx: mpsc::UnboundedReceiver<Job>,
     health: Arc<Mutex<Health>>,
     stop_generation: Arc<AtomicU64>,
+    stop_notify: Arc<Notify>,
     mut sequence: u16,
 ) {
     let mut active_lease: Option<ActiveLease> = None;
@@ -313,8 +352,14 @@ fn serial_worker(
             if handled_stop_generation != Some(stop_value)
                 || last_stop_attempt.elapsed() >= HEARTBEAT
             {
-                last_stop_result =
-                    send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
+                last_stop_result = send_stop(
+                    &mut port,
+                    &mut sequence,
+                    &stop_generation,
+                    &stop_notify,
+                    &health,
+                )
+                .await;
                 if let Ok(state) = last_stop_result {
                     last_state = state;
                     if state == MotionState::Stopped {
@@ -331,8 +376,14 @@ fn serial_worker(
         } else if let Some(active) = active_lease {
             if now >= active.expires_at {
                 active_lease = None;
-                last_stop_result =
-                    send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
+                last_stop_result = send_stop(
+                    &mut port,
+                    &mut sequence,
+                    &stop_generation,
+                    &stop_notify,
+                    &health,
+                )
+                .await;
                 if let Ok(state) = last_stop_result {
                     last_state = state;
                 }
@@ -342,13 +393,15 @@ fn serial_worker(
                 // required to keep the firmware's motion watchdog alive.
                 let heartbeat = active.motion.unwrap_or(Command::Ping);
                 let result = exchange_next(
-                    port.as_mut(),
+                    &mut port,
                     &mut sequence,
                     heartbeat,
                     &stop_generation,
+                    &stop_notify,
                     None,
                     Some(active.expires_at),
-                );
+                )
+                .await;
                 last_heartbeat = Instant::now();
                 update_health(&health, &result);
                 match result {
@@ -362,8 +415,14 @@ fn serial_worker(
                     }
                     Err(_) => {
                         active_lease = None;
-                        last_stop_result =
-                            send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
+                        last_stop_result = send_stop(
+                            &mut port,
+                            &mut sequence,
+                            &stop_generation,
+                            &stop_notify,
+                            &health,
+                        )
+                        .await;
                         if let Ok(state) = last_stop_result {
                             last_state = state;
                         }
@@ -374,56 +433,191 @@ fn serial_worker(
 
         let now = Instant::now();
         let timeout = if stop_generation.load(Ordering::Acquire) & 1 == 1 {
-            HEARTBEAT.saturating_sub(last_stop_attempt.elapsed())
+            Some(HEARTBEAT.saturating_sub(last_stop_attempt.elapsed()))
         } else if let Some(active) = active_lease {
-            active
-                .expires_at
-                .saturating_duration_since(now)
-                .min(HEARTBEAT.saturating_sub(last_heartbeat.elapsed()))
+            Some(
+                active
+                    .expires_at
+                    .saturating_duration_since(now)
+                    .min(HEARTBEAT.saturating_sub(last_heartbeat.elapsed())),
+            )
         } else {
-            IDLE_WAIT
+            None
         };
 
-        match rx.recv_timeout(timeout) {
-            Ok(job) => match job {
-                Job::Command {
-                    command,
-                    lease_id,
-                    valid_until,
-                    cancelled,
-                    reply,
-                } => {
-                    if cancelled.load(Ordering::Acquire) {
-                        let _ = reply.send(Err(ControlError::Timeout));
+        let job = tokio::select! {
+            biased;
+            job = rx.recv() => job,
+            _ = tokio::time::sleep(timeout.unwrap_or_default()), if timeout.is_some() => continue,
+        };
+        let Some(job) = job else {
+            let _ = send_stop(
+                &mut port,
+                &mut sequence,
+                &stop_generation,
+                &stop_notify,
+                &health,
+            )
+            .await;
+            set_health(&health, Health::Disconnected);
+            break;
+        };
+
+        match job {
+            Job::Command {
+                command,
+                lease_id,
+                valid_until,
+                cancelled,
+                reply,
+            } => {
+                if cancelled.is_cancelled() {
+                    let _ = reply.send(Err(ControlError::Timeout));
+                    continue;
+                }
+                let now = Instant::now();
+                if is_latched(&stop_generation) && command != Command::Stop {
+                    let _ = reply.send(Err(ControlError::Unsafe));
+                    continue;
+                }
+                if valid_until <= now {
+                    let _ = reply.send(Err(ControlError::Expired));
+                    continue;
+                }
+                match active_lease {
+                    Some(active) if active.id != lease_id => {
+                        let _ = reply.send(Err(ControlError::InvalidLease));
                         continue;
                     }
-                    let now = Instant::now();
-                    if is_latched(&stop_generation) && command != Command::Stop {
-                        let _ = reply.send(Err(ControlError::Unsafe));
-                        continue;
-                    }
-                    if valid_until <= now {
+                    Some(active) if active.expires_at <= now => {
+                        active_lease = None;
                         let _ = reply.send(Err(ControlError::Expired));
                         continue;
                     }
-                    match active_lease {
-                        Some(active) if active.id != lease_id => {
-                            let _ = reply.send(Err(ControlError::InvalidLease));
-                            continue;
-                        }
-                        Some(active) if active.expires_at <= now => {
+                    Some(active) if valid_until != active.expires_at => {
+                        let _ = reply.send(Err(ControlError::Expired));
+                        continue;
+                    }
+                    None if last_lease_id == Some(lease_id) => {
+                        let _ = reply.send(Err(ControlError::Expired));
+                        continue;
+                    }
+                    None => {
+                        last_lease_id = Some(lease_id);
+                        active_lease = Some(ActiveLease {
+                            id: lease_id,
+                            expires_at: valid_until,
+                            motion: None,
+                        });
+                    }
+                    _ => {}
+                }
+                if cancelled.is_cancelled() {
+                    let _ = reply.send(Err(ControlError::Timeout));
+                    continue;
+                }
+                if is_latched(&stop_generation) && command != Command::Stop {
+                    active_lease = None;
+                    let _ = reply.send(Err(ControlError::Unsafe));
+                    continue;
+                }
+
+                let result = exchange_next(
+                    &mut port,
+                    &mut sequence,
+                    command,
+                    &stop_generation,
+                    &stop_notify,
+                    Some(&cancelled),
+                    Some(valid_until),
+                )
+                .await;
+                match &result {
+                    Ok(state) if matches!(command, Command::Forward | Command::Backward) => {
+                        if valid_until > Instant::now() && !is_latched(&stop_generation) {
+                            last_lease_id = Some(lease_id);
+                            active_lease = Some(ActiveLease {
+                                id: lease_id,
+                                expires_at: valid_until,
+                                motion: (*state != MotionState::Stopped).then_some(command),
+                            });
+                            last_heartbeat = Instant::now();
+                        } else {
                             active_lease = None;
-                            let _ = reply.send(Err(ControlError::Expired));
-                            continue;
                         }
-                        Some(active) if valid_until != active.expires_at => {
-                            let _ = reply.send(Err(ControlError::Expired));
-                            continue;
+                    }
+                    Ok(_) if command == Command::Stop => {
+                        last_lease_id = Some(lease_id);
+                        active_lease = Some(ActiveLease {
+                            id: lease_id,
+                            expires_at: valid_until,
+                            motion: None,
+                        });
+                    }
+                    Err(_) if matches!(command, Command::Forward | Command::Backward) => {
+                        active_lease = None;
+                        last_stop_result = send_stop(
+                            &mut port,
+                            &mut sequence,
+                            &stop_generation,
+                            &stop_notify,
+                            &health,
+                        )
+                        .await;
+                        if let Ok(state) = last_stop_result {
+                            last_state = state;
                         }
-                        None if last_lease_id == Some(lease_id) => {
-                            let _ = reply.send(Err(ControlError::Expired));
-                            continue;
+                    }
+                    Err(_) if command == Command::Stop => {
+                        active_lease = None;
+                        last_stop_result = send_stop(
+                            &mut port,
+                            &mut sequence,
+                            &stop_generation,
+                            &stop_notify,
+                            &health,
+                        )
+                        .await;
+                        if let Ok(state) = last_stop_result {
+                            last_state = state;
                         }
+                    }
+                    _ => {}
+                }
+                if let Ok(state) = result {
+                    last_state = state;
+                }
+                update_health(&health, &result);
+                let _ = reply.send(result);
+            }
+            Job::RenewLease {
+                lease_id,
+                valid_until,
+                cancelled,
+                reply,
+            } => {
+                let now = Instant::now();
+                let result = if cancelled.is_cancelled() {
+                    Err(ControlError::Timeout)
+                } else if is_latched(&stop_generation) {
+                    Err(ControlError::Unsafe)
+                } else if valid_until <= now {
+                    Err(ControlError::Expired)
+                } else {
+                    match active_lease.as_mut() {
+                        Some(active)
+                            if active.id == lease_id
+                                && active.expires_at > now
+                                && valid_until <= active.expires_at =>
+                        {
+                            Err(ControlError::LeaseNotExtended)
+                        }
+                        Some(active) if active.id == lease_id && active.expires_at > now => {
+                            active.expires_at = valid_until;
+                            Ok(())
+                        }
+                        Some(active) if active.id == lease_id => Err(ControlError::Expired),
+                        None if last_lease_id == Some(lease_id) => Err(ControlError::Expired),
                         None => {
                             last_lease_id = Some(lease_id);
                             active_lease = Some(ActiveLease {
@@ -431,283 +625,217 @@ fn serial_worker(
                                 expires_at: valid_until,
                                 motion: None,
                             });
+                            last_heartbeat = now;
+                            Ok(())
                         }
-                        _ => {}
+                        Some(_) => Err(ControlError::InvalidLease),
                     }
-                    if cancelled.load(Ordering::Acquire) {
-                        let _ = reply.send(Err(ControlError::Timeout));
-                        continue;
-                    }
-                    if is_latched(&stop_generation) && command != Command::Stop {
-                        active_lease = None;
-                        let _ = reply.send(Err(ControlError::Unsafe));
-                        continue;
-                    }
-
-                    let result = exchange_next(
-                        port.as_mut(),
-                        &mut sequence,
-                        command,
-                        &stop_generation,
-                        Some(&cancelled),
-                        Some(valid_until),
-                    );
-                    match &result {
-                        Ok(state) if matches!(command, Command::Forward | Command::Backward) => {
-                            if valid_until > Instant::now() && !is_latched(&stop_generation) {
-                                last_lease_id = Some(lease_id);
-                                active_lease = Some(ActiveLease {
-                                    id: lease_id,
-                                    expires_at: valid_until,
-                                    motion: (*state != MotionState::Stopped).then_some(command),
-                                });
-                                last_heartbeat = Instant::now();
-                            } else {
-                                active_lease = None;
-                            }
-                        }
-                        Ok(_) if command == Command::Stop => {
-                            last_lease_id = Some(lease_id);
-                            active_lease = Some(ActiveLease {
-                                id: lease_id,
-                                expires_at: valid_until,
-                                motion: None,
-                            });
-                        }
-                        Err(_) if matches!(command, Command::Forward | Command::Backward) => {
-                            active_lease = None;
-                            last_stop_result =
-                                send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
-                            if let Ok(state) = last_stop_result {
-                                last_state = state;
-                            }
-                        }
-                        Err(_) if command == Command::Stop => {
-                            active_lease = None;
-                            last_stop_result =
-                                send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
-                            if let Ok(state) = last_stop_result {
-                                last_state = state;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if let Ok(state) = result {
-                        last_state = state;
-                    }
-                    update_health(&health, &result);
-                    let _ = reply.send(result);
-                }
-                Job::RenewLease {
-                    lease_id,
-                    valid_until,
-                    cancelled,
-                    reply,
-                } => {
-                    let now = Instant::now();
-                    let result = if cancelled.load(Ordering::Acquire) {
-                        Err(ControlError::Timeout)
-                    } else if is_latched(&stop_generation) {
-                        Err(ControlError::Unsafe)
-                    } else if valid_until <= now {
-                        Err(ControlError::Expired)
-                    } else {
-                        match active_lease.as_mut() {
-                            Some(active)
-                                if active.id == lease_id
-                                    && active.expires_at > now
-                                    && valid_until <= active.expires_at =>
-                            {
-                                Err(ControlError::LeaseNotExtended)
-                            }
-                            Some(active) if active.id == lease_id && active.expires_at > now => {
-                                active.expires_at = valid_until;
-                                Ok(())
-                            }
-                            Some(active) if active.id == lease_id => Err(ControlError::Expired),
-                            None if last_lease_id == Some(lease_id) => Err(ControlError::Expired),
-                            None => {
-                                last_lease_id = Some(lease_id);
-                                active_lease = Some(ActiveLease {
-                                    id: lease_id,
-                                    expires_at: valid_until,
-                                    motion: None,
-                                });
-                                last_heartbeat = now;
-                                Ok(())
-                            }
-                            Some(_) => Err(ControlError::InvalidLease),
-                        }
-                    };
-                    let _ = reply.send(result);
-                }
-                Job::Stop { reply } => {
-                    active_lease = None;
-                    let result = exchange_next(
-                        port.as_mut(),
-                        &mut sequence,
-                        Command::Stop,
-                        &stop_generation,
-                        None,
-                        None,
-                    );
-                    if let Ok(state) = result {
-                        last_state = state;
-                        last_stop_result = Ok(state);
-                        let generation = stop_generation.load(Ordering::Acquire);
-                        if generation & 1 == 1 && state == MotionState::Stopped {
-                            confirmed_stop_generation = Some(generation);
-                        }
-                    } else {
-                        last_stop_result = result.clone();
-                    }
-                    update_health(&health, &result);
-                    let _ = reply.send(result);
-                }
-                Job::EmergencyStop { reply } => {
-                    active_lease = None;
+                };
+                let _ = reply.send(result);
+            }
+            Job::Stop { reply } => {
+                active_lease = None;
+                let result = exchange_next(
+                    &mut port,
+                    &mut sequence,
+                    Command::Stop,
+                    &stop_generation,
+                    &stop_notify,
+                    None,
+                    None,
+                )
+                .await;
+                if let Ok(state) = result {
+                    last_state = state;
+                    last_stop_result = Ok(state);
                     let generation = stop_generation.load(Ordering::Acquire);
-                    if generation & 1 == 1 && handled_stop_generation != Some(generation) {
-                        last_stop_result =
-                            send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
-                        if let Ok(state) = last_stop_result {
-                            last_state = state;
-                            if state == MotionState::Stopped {
-                                confirmed_stop_generation = Some(generation);
-                            }
-                        }
-                        handled_stop_generation = Some(generation);
-                        last_stop_attempt = Instant::now();
+                    if generation & 1 == 1 && state == MotionState::Stopped {
+                        confirmed_stop_generation = Some(generation);
                     }
-                    let _ = reply.send(last_stop_result.clone());
+                } else {
+                    last_stop_result = result.clone();
                 }
-                Job::ClearEmergencyStop {
-                    generation,
-                    cancelled,
-                    reply,
-                } => {
-                    let result = if cancelled.load(Ordering::Acquire) {
-                        Err(ControlError::Timeout)
-                    } else if active_lease.is_some() {
-                        Err(ControlError::Unsafe)
-                    } else if generation & 1 == 0
-                        || confirmed_stop_generation != Some(generation)
-                        || stop_generation
-                            .compare_exchange(
-                                generation,
-                                generation.wrapping_add(1),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_err()
-                    {
-                        Err(ControlError::Unsafe)
-                    } else {
-                        confirmed_stop_generation = None;
-                        handled_stop_generation = None;
-                        last_stop_result = Ok(MotionState::Stopped);
-                        Ok(())
-                    };
-                    let _ = reply.send(result);
-                }
-                Job::ReadState { reply } => {
-                    if active_lease.is_some_and(|active| Instant::now() >= active.expires_at) {
-                        active_lease = None;
-                        last_stop_result =
-                            send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
-                        if let Ok(state) = last_stop_result {
-                            last_state = state;
-                        }
-                    }
-                    let generation = stop_generation.load(Ordering::Acquire);
-                    let result = if generation & 1 == 1 {
-                        if confirmed_stop_generation == Some(generation)
-                            && last_state == MotionState::Stopped
-                        {
-                            Ok(MotionState::Stopped)
-                        } else {
-                            Err(ControlError::Unsafe)
-                        }
-                    } else if active_lease.is_none() {
-                        if last_state == MotionState::Stopped {
-                            Ok(MotionState::Stopped)
-                        } else {
-                            Err(ControlError::Unsafe)
-                        }
-                    } else {
-                        exchange_next(
-                            port.as_mut(),
-                            &mut sequence,
-                            Command::Status,
-                            &stop_generation,
-                            None,
-                            active_lease.map(|active| active.expires_at),
-                        )
-                    };
-                    if let Ok(state) = result {
+                update_health(&health, &result);
+                let _ = reply.send(result);
+            }
+            Job::EmergencyStop { reply } => {
+                active_lease = None;
+                let generation = stop_generation.load(Ordering::Acquire);
+                if generation & 1 == 1 && handled_stop_generation != Some(generation) {
+                    last_stop_result = send_stop(
+                        &mut port,
+                        &mut sequence,
+                        &stop_generation,
+                        &stop_notify,
+                        &health,
+                    )
+                    .await;
+                    if let Ok(state) = last_stop_result {
                         last_state = state;
                         if state == MotionState::Stopped {
-                            if let Some(active) = active_lease.as_mut() {
-                                active.motion = None;
-                            }
-                        }
-                    } else {
-                        active_lease = None;
-                        if generation & 1 == 0 {
-                            last_stop_result =
-                                send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
+                            confirmed_stop_generation = Some(generation);
                         }
                     }
-                    update_health(&health, &result);
-                    let _ = reply.send(result);
+                    handled_stop_generation = Some(generation);
+                    last_stop_attempt = Instant::now();
                 }
-            },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = send_stop(port.as_mut(), &mut sequence, &stop_generation, &health);
-                set_health(&health, Health::Disconnected);
-                break;
+                let _ = reply.send(last_stop_result.clone());
+            }
+            Job::ClearEmergencyStop {
+                generation,
+                cancelled,
+                reply,
+            } => {
+                let result = if cancelled.is_cancelled() {
+                    Err(ControlError::Timeout)
+                } else if active_lease.is_some() {
+                    Err(ControlError::Unsafe)
+                } else if generation & 1 == 0
+                    || confirmed_stop_generation != Some(generation)
+                    || stop_generation
+                        .compare_exchange(
+                            generation,
+                            generation.wrapping_add(1),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                {
+                    Err(ControlError::Unsafe)
+                } else {
+                    confirmed_stop_generation = None;
+                    handled_stop_generation = None;
+                    last_stop_result = Ok(MotionState::Stopped);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            Job::ReadState { reply } => {
+                if active_lease.is_some_and(|active| Instant::now() >= active.expires_at) {
+                    active_lease = None;
+                    last_stop_result = send_stop(
+                        &mut port,
+                        &mut sequence,
+                        &stop_generation,
+                        &stop_notify,
+                        &health,
+                    )
+                    .await;
+                    if let Ok(state) = last_stop_result {
+                        last_state = state;
+                    }
+                }
+                let generation = stop_generation.load(Ordering::Acquire);
+                let result = if generation & 1 == 1 {
+                    if confirmed_stop_generation == Some(generation)
+                        && last_state == MotionState::Stopped
+                    {
+                        Ok(MotionState::Stopped)
+                    } else {
+                        Err(ControlError::Unsafe)
+                    }
+                } else if active_lease.is_none() {
+                    if last_state == MotionState::Stopped {
+                        Ok(MotionState::Stopped)
+                    } else {
+                        Err(ControlError::Unsafe)
+                    }
+                } else {
+                    exchange_next(
+                        &mut port,
+                        &mut sequence,
+                        Command::Status,
+                        &stop_generation,
+                        &stop_notify,
+                        None,
+                        active_lease.map(|active| active.expires_at),
+                    )
+                    .await
+                };
+                if let Ok(state) = result {
+                    last_state = state;
+                    if state == MotionState::Stopped {
+                        if let Some(active) = active_lease.as_mut() {
+                            active.motion = None;
+                        }
+                    }
+                } else {
+                    active_lease = None;
+                    if generation & 1 == 0 {
+                        last_stop_result = send_stop(
+                            &mut port,
+                            &mut sequence,
+                            &stop_generation,
+                            &stop_notify,
+                            &health,
+                        )
+                        .await;
+                    }
+                }
+                update_health(&health, &result);
+                let _ = reply.send(result);
             }
         }
     }
 }
 
-fn send_stop(
-    port: &mut dyn SerialPort,
+async fn send_stop(
+    port: &mut SerialStream,
     sequence: &mut u16,
     stop_generation: &AtomicU64,
+    stop_notify: &Notify,
     health: &Mutex<Health>,
 ) -> Result<MotionState, ControlError> {
-    let result = exchange_next(port, sequence, Command::Stop, stop_generation, None, None);
+    let result = exchange_next(
+        port,
+        sequence,
+        Command::Stop,
+        stop_generation,
+        stop_notify,
+        None,
+        None,
+    )
+    .await;
     update_health(health, &result);
     result
 }
 
-fn exchange_next(
-    port: &mut dyn SerialPort,
+async fn exchange_next(
+    port: &mut SerialStream,
     sequence: &mut u16,
     command: Command,
     stop_generation: &AtomicU64,
-    cancelled: Option<&AtomicBool>,
+    stop_notify: &Notify,
+    cancelled: Option<&Cancellation>,
     valid_until: Option<Instant>,
 ) -> Result<MotionState, ControlError> {
     let seq = *sequence;
     *sequence = (*sequence).wrapping_add(1);
-    exchange(port, seq, command, stop_generation, cancelled, valid_until)
+    exchange(
+        port,
+        seq,
+        command,
+        stop_generation,
+        stop_notify,
+        cancelled,
+        valid_until,
+    )
+    .await
 }
 
-fn exchange(
-    port: &mut dyn SerialPort,
+async fn exchange(
+    port: &mut SerialStream,
     seq: u16,
     cmd: Command,
     stop_generation: &AtomicU64,
-    cancelled: Option<&AtomicBool>,
+    stop_notify: &Notify,
+    cancelled: Option<&Cancellation>,
     valid_until: Option<Instant>,
 ) -> Result<MotionState, ControlError> {
     if valid_until.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(ControlError::Expired);
     }
-    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+    if cancelled.is_some_and(Cancellation::is_cancelled) {
         return Err(ControlError::Timeout);
     }
     if is_latched(stop_generation) && cmd != Command::Stop {
@@ -717,16 +845,19 @@ fn exchange(
     let mut payload = String::new();
     protocol::encode_request(&mut payload, Request { seq, command: cmd })
         .map_err(|e| ControlError::Transport(e.to_string()))?;
-    port.write_all(payload.as_bytes())
-        .map_err(|e| ControlError::Transport(e.to_string()))?;
+    match timeout(WRITE_TIMEOUT, port.write_all(payload.as_bytes())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(ControlError::Transport(error.to_string())),
+        Err(_) => return Err(ControlError::Timeout),
+    }
 
     let deadline = Instant::now() + ACK_TIMEOUT;
     let mut line = Vec::with_capacity(64);
-    while Instant::now() < deadline {
+    loop {
         if valid_until.is_some_and(|valid_until| Instant::now() >= valid_until) {
             return Err(ControlError::Expired);
         }
-        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        if cancelled.is_some_and(Cancellation::is_cancelled) {
             return Err(ControlError::Timeout);
         }
         if is_latched(stop_generation) && cmd != Command::Stop {
@@ -734,39 +865,55 @@ fn exchange(
         }
 
         let mut bytes = [0u8; 64];
-        match port.read(&mut bytes) {
-            Ok(n) => {
-                for &byte in &bytes[..n] {
-                    if byte == b'\n' {
-                        if let Ok(s) = std::str::from_utf8(&line) {
-                            if let Ok(resp) = protocol::decode_response(s) {
-                                if resp.seq == seq {
-                                    if valid_until
-                                        .is_some_and(|valid_until| Instant::now() >= valid_until)
-                                    {
-                                        return Err(ControlError::Expired);
-                                    }
-                                    let state = validate_response(resp)?;
-                                    if cmd == Command::Stop && state != MotionState::Stopped {
-                                        return Err(ControlError::Unsafe);
-                                    }
-                                    return Ok(state);
-                                }
-                            }
-                        }
-                        line.clear();
-                    } else if line.len() >= 63 {
-                        line.clear();
-                    } else if byte != b'\r' {
-                        line.push(byte);
-                    }
+        tokio::select! {
+            biased;
+            _ = async { if let Some(cancelled) = cancelled { cancelled.cancelled().await; } }, if cancelled.is_some() => {
+                return Err(ControlError::Timeout);
+            }
+            _ = stop_notify.notified(), if cmd != Command::Stop => {
+                if is_latched(stop_generation) {
+                    return Err(ControlError::Unsafe);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(ControlError::Transport(e.to_string())),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                if valid_until.is_some_and(|valid_until| Instant::now() >= valid_until) {
+                    return Err(ControlError::Expired);
+                }
+                return Err(ControlError::Timeout);
+            }
+            read = port.read(&mut bytes) => {
+                match read {
+                    Ok(0) => return Err(ControlError::Disconnected),
+                    Ok(n) => {
+                        for &byte in &bytes[..n] {
+                            if byte == b'\n' {
+                                if let Ok(s) = std::str::from_utf8(&line) {
+                                    if let Ok(resp) = protocol::decode_response(s) {
+                                        if resp.seq == seq {
+                                            if valid_until.is_some_and(|valid_until| Instant::now() >= valid_until) {
+                                                return Err(ControlError::Expired);
+                                            }
+                                            let state = validate_response(resp)?;
+                                            if cmd == Command::Stop && state != MotionState::Stopped {
+                                                return Err(ControlError::Unsafe);
+                                            }
+                                            return Ok(state);
+                                        }
+                                    }
+                                }
+                                line.clear();
+                            } else if line.len() >= 63 {
+                                line.clear();
+                            } else if byte != b'\r' {
+                                line.push(byte);
+                            }
+                        }
+                    }
+                    Err(error) => return Err(ControlError::Transport(error.to_string())),
+                }
+            }
         }
     }
-    Err(ControlError::Timeout)
 }
 
 fn validate_response(resp: Response) -> Result<MotionState, ControlError> {
@@ -802,7 +949,7 @@ fn is_latched(generation: &AtomicU64) -> bool {
     generation.load(Ordering::Acquire) & 1 == 1
 }
 
-fn latch_stop(generation: &AtomicU64) {
+fn latch_stop(generation: &AtomicU64, stop_notify: &Notify) {
     let mut current = generation.load(Ordering::Acquire);
     loop {
         let next = if current & 1 == 0 {
@@ -811,7 +958,10 @@ fn latch_stop(generation: &AtomicU64) {
             current.wrapping_add(2)
         };
         match generation.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
+            Ok(_) => {
+                stop_notify.notify_one();
+                return;
+            }
             Err(actual) => current = actual,
         }
     }
