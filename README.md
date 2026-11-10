@@ -136,15 +136,19 @@ forward, `b` reverse, `s` stop, `?` state, `h` device health, `e` latched
 software emergency stop, `r` checked reset, and `q` release control and quit.
 The CLI renews a short control lease while it is running. The USB worker repeats
 the active direction while that lease is valid, sends STOP at expiry, and stops
-background watchdog traffic after control is lost. The Pico watchdog provides a
-second stop path after about 1.5 seconds without a valid request. These are
-best-effort software safeguards, not a certified physical emergency stop.
-The current firmware refreshes that watchdog for every valid protocol request,
+background watchdog traffic after control is lost. Firmware also stops motion
+after 1.5 seconds without a valid request. A separate RP2350 hardware watchdog
+reboots the MCU if its main loop stalls; it does not replace that command-timeout
+stop path. These are best-effort software safeguards, not a certified physical
+emergency stop.
+The firmware command timeout is refreshed by every valid protocol request,
 including STATUS and PING, so additional drivers must not poll after losing
-their control lease. `?` performs a fresh query only while a lease is active;
-without one, the driver returns a cached stopped state or rejects a moving or
-unknown state. A latched stop blocks `?`. Reset sends a fresh STOP and requires
-a matching `STOPPED` acknowledgement before clearing the latch.
+their control lease. The hardware watchdog is fed by completed main-loop
+iterations, independently of protocol traffic. `?` performs a fresh query only
+while a lease is active; without one, the driver returns a cached stopped state
+or rejects a moving or unknown state. A latched stop blocks `?`. Reset sends a
+fresh STOP and requires a matching `STOPPED` acknowledgement before clearing
+the latch.
 
 For `Permission denied`, add your user to the `dialout` group and re-login.
 

@@ -163,11 +163,12 @@ The safety responsibilities are distinct:
   `serialport` I/O stays on one dedicated worker thread, which prioritizes
   STOP, cancels ordinary serial exchanges when a stop arrives, enforces lease
   deadlines locally, and ceases background watchdog traffic after a lease ends.
-- Pico firmware has a 1.5-second watchdog. Its current implementation refreshes
-  the watchdog on every valid request, including STATUS and PING. The host
-  driver therefore re-sends the active direction while a lease is valid and
-  avoids polling once it has lost the lease and the last known motion was not
-  stopped.
+- Pico firmware has a 1.5-second command timeout, refreshed by every valid
+  request including STATUS and PING. A separate RP2350 hardware watchdog is
+  fed after each completed main-loop iteration and resets the MCU if that loop
+  stalls. The host driver therefore re-sends the active direction while a
+  lease is valid and avoids polling once it has lost the lease and the last
+  known motion was not stopped.
 
 `?` sends a fresh STATUS only while the driver has a valid control lease. With
 no active lease it returns the cached stopped state, or rejects the query if
