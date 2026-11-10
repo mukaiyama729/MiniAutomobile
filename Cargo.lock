@@ -116,12 +116,14 @@ dependencies = [
  "robot-application",
  "robot-device-manager",
  "robot-domain",
+ "robot-state",
 ]
 
 [[package]]
 name = "robot-device-manager"
 version = "0.1.0"
 dependencies = [
+ "robot-application",
  "robot-domain",
 ]
 
@@ -132,6 +134,14 @@ version = "0.1.0"
 [[package]]
 name = "robot-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "robot-state"
+version = "0.1.0"
+dependencies = [
+ "robot-application",
+ "robot-domain",
+]
 
 [[package]]
 name = "scopeguard"

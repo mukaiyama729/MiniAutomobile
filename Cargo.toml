@@ -4,6 +4,7 @@ members = [
   "crates/robot-adapter/protocol",
   "crates/robot-domain",
   "crates/robot-application",
+  "crates/robot-state",
   "crates/robot-device-manager",
   "crates/robot-adapter/drivers/pico-usb",
   "apps/robot-cli",

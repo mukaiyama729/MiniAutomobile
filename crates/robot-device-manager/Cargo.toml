@@ -4,3 +4,4 @@ version = "0.1.0"
 edition = "2024"
 [dependencies]
 robot-domain = { path = "../robot-domain" }
+robot-application = { path = "../robot-application" }

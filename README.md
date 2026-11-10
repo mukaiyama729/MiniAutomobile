@@ -1,38 +1,41 @@
 # Robot System: Pico 2 + Ubuntu
 
-A Rust controller for a Raspberry Pi Pico 2 (RP2350) and one 28BYJ-48 stepper
-motor, organized so hardware drivers, communication transports, and ROS 2
-bridges can grow independently.
+A Rust robot-control foundation for Ubuntu/Jetson and a Raspberry Pi Pico 2
+(RP2350). The current hardware path drives a 28BYJ-48 stepper through USB CDC;
+the application boundary is structured for future devices and middleware.
 
 ## Repository layout
 
 ```text
 crates/
-  robot-domain/                 Hardware-independent types
-  robot-application/             Use cases and ports
-  robot-device-manager/          Device registration and health
+  robot-domain/                  Hardware-independent types and rules
+  robot-application/              Inbound/outbound ports, use case, coordination
+  robot-state/                    Versioned shared snapshots and narrow writers
+  robot-device-manager/           Device registration and health
   robot-adapter/
     drivers/
-      pico-usb/                  Linux USB CDC driver
-      camera-v4l2/               Future camera driver
-      lidar-usb/                 Future LiDAR driver
-    transports/                  Shared USB, CAN, UDP transport code
+      pico-usb/                   Linux USB CDC driver
+    transports/                   Future shared USB, CAN, UDP code
     bridges/
-      ros2/                      ROS 2 integration
-      autoware/                  Autoware integration
-    protocol/                    robot-protocol Git submodule
-    firmware/                    robot-firmware Git submodule
-apps/robot-cli/                   Current command-line entry point
-config/                           Example device configuration
-docs/                             Architecture notes
-.github/workflows/                CI and submodule update PRs
+      ros2/                       Future ROS 2 integration
+      autoware/                   Future Autoware integration
+    protocol/                     robot-protocol Git submodule
+    firmware/                     robot-firmware Git submodule
+apps/robot-cli/                    Composition root and current CLI
+config/                            Example device configuration
+docs/                              Architecture notes
+.github/workflows/                 CI and submodule update PRs
 ```
 
-The main repository contains Linux and ROS 2 integration. `robot-protocol` is
-shared by Linux and Pico firmware. `robot-firmware` owns the embedded Cargo
-workspace. Both child repositories are pinned to commits by Git submodules.
-See [docs/architecture.md](docs/architecture.md) for the control flow and
-update policy.
+The CLI path now goes through the application command gateway, resource
+arbiter, safety state, and motor port. `robot-state` provides a consistent
+snapshot of motion, control ownership, and the safety latch. ROS 2, Autoware,
+camera, LiDAR, mission workflow, perception, and localization adapters remain
+future work; their directories are not represented as implemented crates.
+`robot-protocol` is shared by Linux and Pico firmware, while `robot-firmware`
+owns the embedded Cargo workspace. Both are pinned by Git submodules. See
+[docs/architecture.md](docs/architecture.md) for current boundaries and safety
+limits.
 
 ## Clone and update
 
@@ -129,10 +132,19 @@ cargo run -p robot-cli -- /dev/ttyACM0
 ```
 
 Use the actual `/dev/serial/by-id/...` path when available. Commands are `f`
-forward, `b` reverse, `s` stop, `?` state, `h` device health, and `q` stop and
-quit. The I/O worker sends heartbeat packets while waiting for keyboard input,
-so rotation continues while USB is connected. On link loss the Pico stops in
-about 1.5 seconds and does not automatically resume when reconnected.
+forward, `b` reverse, `s` stop, `?` state, `h` device health, `e` latched
+software emergency stop, `r` checked reset, and `q` release control and quit.
+The CLI renews a short control lease while it is running. The USB worker repeats
+the active direction while that lease is valid, sends STOP at expiry, and stops
+background watchdog traffic after control is lost. The Pico watchdog provides a
+second stop path after about 1.5 seconds without a valid request. These are
+best-effort software safeguards, not a certified physical emergency stop.
+The current firmware refreshes that watchdog for every valid protocol request,
+including STATUS and PING, so additional drivers must not poll after losing
+their control lease. `?` performs a fresh query only while a lease is active;
+without one, the driver returns a cached stopped state or rejects a moving or
+unknown state. A latched stop blocks `?`. Reset sends a fresh STOP and requires
+a matching `STOPPED` acknowledgement before clearing the latch.
 
 For `Permission denied`, add your user to the `dialout` group and re-login.
 
