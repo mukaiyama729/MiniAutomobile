@@ -9,8 +9,10 @@
 ```mermaid
 flowchart LR
     User[利用者]
-    CLI[CLI入力タスク]
+    Input[stdin入力タスク]
     InputQ[入力イベント mpsc]
+    CLI[CliController<br/>入力の受付・表示]
+    PortIn[DriveControl<br/>application inbound port]
     UseCase[DriveUseCase<br/>操作の入口]
     Gateway[CommandGateway<br/>受付・順序制御]
     Arbiter[ResourceArbiter<br/>安全・権限・期限の確認]
@@ -23,14 +25,14 @@ flowchart LR
     Pico[Pico 2 ファームウェア]
     Motor[ULN2003 → モーター]
 
-    User --> CLI --> InputQ --> UseCase --> Gateway --> Arbiter
+    User --> Input --> InputQ --> CLI --> PortIn --> UseCase --> Gateway --> Arbiter
     Arbiter <--> State
     Gateway --> Port --> Driver --> Worker --> Protocol --> USB --> Pico --> Motor
     Motor -. 動作結果 .-> Pico -. 応答行 .-> USB -.-> Worker -.-> Driver -.-> Port -.-> Gateway
     Gateway -. 確認済みの状態を書き込む .-> State
 ```
 
-矢印が示すとおり、CLIはUSBのバイト列を直接作りません。ロボット操作の依頼をアプリケーションに渡し、デバイス固有の通信はアダプターに任せます。この分け方により、将来CLI以外の入力元を足す場合も、USBの詳細を各入力元にコピーせずに済みます。
+矢印が示すとおり、CLIはUSBのバイト列を直接作りません。`CliController` が端末入力をアプリケーションの `DriveControl` に渡し、デバイス固有の通信はアダプターに任せます。この分け方により、将来CLI以外の入力元を足す場合も、USBの詳細を各入力元にコピーせずに済みます。
 
 実装されているのはCLIとPico USBモーターの経路です。ROS 2、Autoware、カメラ、LiDAR、ネットワークRPCは、今後接続するための拡張先であり、現時点の動作機能ではありません。
 
@@ -76,7 +78,9 @@ Tokioのチャネルは、同じプログラム内のタスク間で値を渡す
 | `oneshot` | 1回だけ使う返信用の封筒 | キューに仕事を入れた呼び出し元へ、成功・失敗や状態を返す |
 | `watch` | 最新値だけを知らせる掲示板 | CLIの終了フラグ。受信側は `true` になったことを知る |
 | `Notify` | 値を運ばず「変化があった」と起こすベル | 非常停止を知らせ、シリアル応答待ちを中断する |
-| `Arc` / atomic | 参照の共有 / 小さな値の素早い共有 | 状態や停止フラグなどを複数のタスクから参照する |
+| `Arc` / atomic | 参照の共有 / 小さな値の素早い共有 | 状態や停止フラグなどを複数のタスクから参照する（標準ライブラリの機能） |
+
+`mpsc`、`oneshot`、`watch`、`Notify` はTokioの同期プリミティブです。`Arc`、`Mutex`、`RwLock`、atomic型はRust標準ライブラリの機能で、Tokioのチャネルとは役割が異なります。
 
 #### `mpsc`: 仕事を並べるキュー
 
@@ -84,7 +88,7 @@ Tokioのチャネルは、同じプログラム内のタスク間で値を渡す
 
 このレポジトリでは、容量付きキューが2か所にあります。
 
-- CLI入力キューは容量32です。入力タスクがコマンドを送り、メインタスクが処理します。満杯なら通常コマンドは捨て、`s`（通常停止）は非常停止へ格上げします。
+- CLI入力キューは容量32です。入力タスクがコマンドを送り、`CliController` が処理します。満杯なら通常コマンドは捨て、`s`（通常停止）は非常停止へ格上げします。
 - アプリケーションのコマンドキューも容量32です。満杯のとき `try_send` は待ち続けず、`CommandQueueFull` を返します。コマンドの滞留が際限なく増えるのを防ぎます。
 
 USBドライバー内の仕事キューは `mpsc::unbounded_channel` です。これは容量上限のないキューなので、送り手は空き容量を待ちません。その代わり、使い過ぎると待ち仕事が増え続ける性質があります。通常のモーター操作は上流の容量付きゲートウェイを通す設計で、シリアルポート自体は一つのワーカーだけが扱います。
@@ -102,7 +106,7 @@ USBドライバー内の仕事キューは `mpsc::unbounded_channel` です。�
 
 #### `watch`: 履歴を残さず最新の状態を伝える
 
-CLIの終了通知は `watch<bool>` です。`q` を入力したタスクが `true` を送り、メインタスクが `changed()` を待っています。古い通知をすべて順番に処理する必要はなく、「終了するかどうか」の最新値だけ知ればよいので `watch` が合います。
+CLIの終了通知は `watch<bool>` です。`q` を入力したタスクが `true` を送り、`CliController` のループが `changed()` を待っています。古い通知をすべて順番に処理する必要はなく、「終了するかどうか」の最新値だけ知ればよいので `watch` が合います。
 
 コマンド履歴の配送には向きません。履歴を一件ずつ処理する必要があるものには `mpsc` を使います。
 
@@ -254,9 +258,23 @@ let state = drive.drive(lease, Direction::Forward).await?;
 
 ### 3.2 ランタイム、タスク、`spawn`
 
-`#[tokio::main]` は `main` の前にTokioランタイムを用意します。ワークスペースのTokioは、マルチスレッドランタイム、タスク生成、チャネル、時間、非同期I/Oの機能を有効にしています。
+`#[tokio::main]` は `apps/robot-cli` の `main` の前にTokioランタイムを用意します。ワークスペースでは `rt-multi-thread`、`macros`、`sync`、`time`、`io-util`、`io-std` を有効にしています。CLI起動時はこのランタイム上で、入力ループと複数の常駐タスクを動かします。
 
-`tokio::spawn(async move { ... })` は、非同期処理をランタイム上の別タスクとして動かします。このコードでは、起動時にコマンドゲートウェイのcoordinatorとシリアルワーカーを起動し、CLI入力読み取りも独立タスクにします。ひとつの仕事がI/Oを待っていても、ランタイムは他のタスクを進められます。
+このプロジェクトでの主な使い分けは次のとおりです。
+
+| 目的 | Tokio API | 使用箇所 |
+|---|---|---|
+| ランタイム起動 | `#[tokio::main]` | `apps/robot-cli/src/main.rs` |
+| 長寿命の独立処理 | `tokio::spawn` | command coordinator、Picoシリアルワーカー、CLI標準入力読み取り |
+| 要求・返信 | `mpsc`、`oneshot` | `CommandGateway` と `PicoUsbMotor` |
+| 終了・緊急通知 | `watch`、`Notify` | CLI終了通知、Picoドライバーの非常停止通知 |
+| 複数イベント待ち | `tokio::select!` | CLIループ、シリアル応答・キャンセル・停止の待機 |
+| 期限・タイムアウト | `Instant`、`sleep_until`、`timeout` | リース更新、応答待ち、書き込み・API期限 |
+| 同期I/Oの隔離 | `spawn_blocking` | シリアルポートを開く処理 |
+
+Tokioの具体的なバージョンと機能フラグは、ルートの `Cargo.toml` の `[workspace.dependencies]` にあります。
+
+`tokio::spawn(async move { ... })` は、非同期処理をランタイム上の別タスクとして動かします。このコードでは、コマンドゲートウェイのcoordinator、シリアルワーカー、CLI標準入力読み取りを独立タスクにします。ひとつの仕事がI/Oを待っていても、ランタイムは他のタスクを進められます。
 
 重要なのは、シリアルポートの所有者が一つのワーカーだという点です。タスクを分ける目的は、同じポートをみんなで同時に触ることではなく、依頼を安全に直列化しながら、呼び出し元の待機中も他の処理を進めることです。
 
@@ -264,11 +282,13 @@ let state = drive.drive(lease, Direction::Forward).await?;
 
 `tokio::select!` は、複数の非同期処理のうち、先に準備できたものを処理します。
 
-- CLIのメインタスクは、終了通知・次のリース更新時刻・入力イベントを並行して待ちます。
+- `CliController` のループは、終了通知・次のリース更新時刻・入力イベントを並行して待ちます。
 - USBワーカーは、次の仕事とリース期限・ハートビート時刻を待ちます。
 - シリアル交換中は、返事の読み込み・タイムアウト・呼び出し元からのキャンセル・非常停止通知を待ちます。
 
 `biased;` がある箇所では、同時に準備できたときに先に書かれた分岐を優先します。シリアル交換では、キャンセルや非常停止通知を通常の読み込みより優先するために使っています。
+
+`select!` は選ばれなかったfutureをその場で破棄します。そのため、I/O待ちを中断したときにどうなるかを意識して使います。CLIの `while_renewing` は操作futureを `tokio::pin!` で固定し、リース更新タイマーが先に発火しても、進行中の操作を捨てずに次のループで待ち直します。シリアル交換では、非常停止や呼び出し元のキャンセルで読み取りを中断する動作を意図して選んでいます。
 
 ### 3.4 タイムアウト、期限、キャンセル
 
@@ -341,6 +361,7 @@ drive.release_control(lease).await?;
 | [`crates/robot-application/src/ports/inbound.rs`](../crates/robot-application/src/ports/inbound.rs) | 入力元が利用する `DriveControl` と `DeviceHealthQuery` |
 | [`crates/robot-application/src/ports/outbound.rs`](../crates/robot-application/src/ports/outbound.rs) | `MotorPort`、状態読み書き、デバイス健康状態の契約 |
 | [`crates/robot-application/src/usecases/device_health.rs`](../crates/robot-application/src/usecases/device_health.rs) | adapter 向けのデバイス健康状態 query |
+| [`Cargo.toml`](../Cargo.toml) | Tokioのworkspace機能フラグ |
 | [`crates/robot-application/src/coordination/command_gateway.rs`](../crates/robot-application/src/coordination/command_gateway.rs) | bounded要求キュー、直列coordinator、リース・指令処理 |
 | [`crates/robot-application/src/coordination/safety_supervisor.rs`](../crates/robot-application/src/coordination/safety_supervisor.rs) | 非常停止のラッチと検査付きリセット |
 | [`crates/robot-state/src/lib.rs`](../crates/robot-state/src/lib.rs) | 共有状態、用途別writer、version付きsnapshot |

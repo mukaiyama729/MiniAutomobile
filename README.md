@@ -38,6 +38,9 @@ owns the embedded Cargo workspace. Both are pinned by Git submodules. See
 [docs/architecture.md](docs/architecture.md) for current boundaries and safety
 limits.
 
+Tokioのタスク、チャネル、タイムアウト、キャンセルの使い方は
+[docs/communication-state-tokio.md](docs/communication-state-tokio.md) を参照してください。
+
 ## Clone and update
 
 The current GitHub remote for the main repository is `mukaiyama729/MiniAutomobile`:
