@@ -99,4 +99,5 @@ pub trait SafetyStateWriter: Send + Sync {
 
 pub trait DeviceHealthReader: Send + Sync {
     fn health(&self, device_id: &str) -> Option<Health>;
+    fn statuses(&self) -> Vec<(String, Health)>;
 }

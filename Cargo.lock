@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "adapter-cli"
+version = "0.1.0"
+dependencies = [
+ "robot-application",
+ "robot-domain",
+ "tokio",
+]
+
+[[package]]
 name = "adapter-pico-usb"
 version = "0.1.0"
 dependencies = [
@@ -200,6 +209,7 @@ dependencies = [
 name = "robot-cli"
 version = "0.1.0"
 dependencies = [
+ "adapter-cli",
  "adapter-pico-usb",
  "robot-application",
  "robot-device-manager",

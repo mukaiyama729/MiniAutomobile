@@ -39,4 +39,8 @@ impl DeviceHealthReader for DeviceManager {
     fn health(&self, device_id: &str) -> Option<Health> {
         self.devices.get(device_id).map(|device| device.health())
     }
+
+    fn statuses(&self) -> Vec<(String, Health)> {
+        DeviceManager::statuses(self)
+    }
 }

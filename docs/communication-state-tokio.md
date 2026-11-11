@@ -298,7 +298,7 @@ let state = drive.drive(lease, Direction::Forward).await?;
 
 ### 4.1 1回の前進指令を追う
 
-1. `apps/robot-cli/src/main.rs` が入力を受け、`f` を `DriveControl::drive` に渡します。
+1. `crates/robot-adapter/cli` の `CliController` が入力を受け、`f` を `DriveControl::drive` に渡します。
 2. `DriveUseCase` が操作元（CLI）、対象資源（DriveBase）、有効期限、リースIDを含む `CommandProposal` を作ります。
 3. `CommandGateway` がbounded `mpsc` でcoordinatorへ依頼し、coordinatorは安全状態・制御モード・リース・装置の健康状態を検査します。
 4. `ResourceArbiter` が提案を認可したあと、coordinatorが `MotorPort::command` を呼びます。
@@ -336,9 +336,11 @@ drive.release_control(lease).await?;
 
 | ファイル | 読むと分かること |
 |---|---|
-| [`apps/robot-cli/src/main.rs`](../apps/robot-cli/src/main.rs) | Tokio起動、CLI入力、リース更新、終了通知 |
-| [`crates/robot-application/src/ports/inbound.rs`](../crates/robot-application/src/ports/inbound.rs) | 入力元が利用する `DriveControl` |
+| [`apps/robot-cli/src/main.rs`](../apps/robot-cli/src/main.rs) | Tokio起動、具体adapter・usecaseの配線 |
+| [`crates/robot-adapter/cli/src/lib.rs`](../crates/robot-adapter/cli/src/lib.rs) | CLI入力、`DriveControl` 呼び出し、リース更新、終了通知 |
+| [`crates/robot-application/src/ports/inbound.rs`](../crates/robot-application/src/ports/inbound.rs) | 入力元が利用する `DriveControl` と `DeviceHealthQuery` |
 | [`crates/robot-application/src/ports/outbound.rs`](../crates/robot-application/src/ports/outbound.rs) | `MotorPort`、状態読み書き、デバイス健康状態の契約 |
+| [`crates/robot-application/src/usecases/device_health.rs`](../crates/robot-application/src/usecases/device_health.rs) | adapter 向けのデバイス健康状態 query |
 | [`crates/robot-application/src/coordination/command_gateway.rs`](../crates/robot-application/src/coordination/command_gateway.rs) | bounded要求キュー、直列coordinator、リース・指令処理 |
 | [`crates/robot-application/src/coordination/safety_supervisor.rs`](../crates/robot-application/src/coordination/safety_supervisor.rs) | 非常停止のラッチと検査付きリセット |
 | [`crates/robot-state/src/lib.rs`](../crates/robot-state/src/lib.rs) | 共有状態、用途別writer、version付きsnapshot |

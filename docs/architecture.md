@@ -8,7 +8,7 @@ and additional sensors are extension points, not completed features.
 ## Current command and feedback paths
 
 ```text
-CLI input adapter
+CLI input adapter (`robot-adapter/cli`)
   -> DriveControl inbound port
   -> DriveUseCase
   -> CommandGateway
@@ -23,20 +23,22 @@ CLI input adapter
   -> Pico 2 -> ULN2003 -> motor
 
 Pico motion reply -> PicoUsbMotor -> motion writer -> RobotStateStore
-Pico device health -> DeviceManager -> CLI health view
+Pico device health -> DeviceManager -> DeviceHealthReader
+  -> DeviceHealthUseCase -> DeviceHealthQuery -> CLI health view
 RobotStateStore -> consistent StateSnapshot -> application readers
 ```
 
 Emergency stop bypasses the ordinary command lock and arbiter:
 
 ```text
-CLI input reader -> SafetySupervisor -> safety latch + SafeStop mode
-                                      -> PicoUsbMotor urgent STOP
+CLI input reader -> DriveControl -> DriveUseCase -> CommandGateway
+  -> SafetySupervisor -> safety latch + SafeStop mode
+  -> PicoUsbMotor urgent STOP
 ```
 
-The async input reader starts the emergency-stop request as soon as it reads
-`e`, even if the CLI is waiting for a status or motion reply. The application
-latch is set before the driver awaits the device acknowledgement.
+The async input reader in the CLI adapter starts the emergency-stop request as
+soon as it reads `e`, even if the CLI is waiting for a status or motion reply.
+The application latch is set before the driver awaits the device acknowledgement.
 The USB worker checks the stop latch while waiting for replies, gives STOP
 priority over queued ordinary jobs, and rejects status/heartbeat work while
 latched.
@@ -46,7 +48,8 @@ latched.
 - `robot-domain` defines hardware- and middleware-independent motion, control,
   lease, resource, proposal, health, and safety types.
 - `robot-application` defines async inbound/outbound I/O ports, `DriveUseCase`,
-  the `CommandGateway`, `ResourceArbiter`, and `SafetySupervisor`. A bounded
+  `DeviceHealthUseCase`, the `CommandGateway`, `ResourceArbiter`, and
+  `SafetySupervisor`. A bounded
   coordinator task owns each accepted ordinary request through its state
   update or safety response, even if the caller drops its response future.
   Emergency stop bypasses that queue. Application code does not depend on USB,
@@ -56,14 +59,18 @@ latched.
   snapshot and narrow writer handles.
 - `robot-device-manager` registers devices and exposes their health through an
   application port.
+- `crates/robot-adapter/cli` implements the terminal input controller. It calls
+  application inbound ports and does not depend on the command gateway or
+  hardware driver.
 - `crates/robot-adapter/drivers/pico-usb` implements the motor port and owns
   the async serial worker task. Other drivers and reusable transports belong
   under `crates/robot-adapter` when implemented.
 - `crates/robot-adapter/protocol` and `crates/robot-adapter/firmware` are
   independent Git submodules. The Linux workspace excludes the embedded
   firmware workspace.
-- `apps/robot-cli` is the current Tokio composition root: it creates concrete
-  adapters, state storage, device management, use case, and the CLI.
+- `apps/robot-cli` is the Tokio composition root: it creates concrete
+  adapters, state storage, device management, and use cases, then starts the
+  CLI adapter.
 
 The intended dependency direction is:
 

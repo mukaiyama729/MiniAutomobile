@@ -1,0 +1,9 @@
+[package]
+name = "adapter-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+robot-application = { path = "../../robot-application" }
+robot-domain = { path = "../../robot-domain" }
+tokio.workspace = true

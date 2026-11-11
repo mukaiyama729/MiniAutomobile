@@ -13,6 +13,7 @@ crates/
   robot-state/                    Versioned shared snapshots and narrow writers
   robot-device-manager/           Device registration and health
   robot-adapter/
+    cli/                          Terminal input adapter
     drivers/
       pico-usb/                   Linux USB CDC driver
     transports/                   Future shared USB, CAN, UDP code
@@ -21,7 +22,7 @@ crates/
       autoware/                   Future Autoware integration
     protocol/                     robot-protocol Git submodule
     firmware/                     robot-firmware Git submodule
-apps/robot-cli/                    Composition root and current CLI
+apps/robot-cli/                    Composition root for the CLI application
 config/                            Example device configuration
 docs/                              Architecture notes
 .github/workflows/                 CI and submodule update PRs

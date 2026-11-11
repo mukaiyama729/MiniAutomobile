@@ -1,6 +1,6 @@
 use crate::ports::outbound::ControlError;
 use async_trait::async_trait;
-use robot_domain::{ControlLease, Direction, MotionState};
+use robot_domain::{ControlLease, Direction, Health, MotionState};
 use std::time::Duration;
 
 /// Application entry point used by CLI, teleoperation, and future ROS bridges.
@@ -24,4 +24,9 @@ pub trait DriveControl: Send + Sync {
     async fn emergency_stop(&self, reason: String) -> Result<MotionState, ControlError>;
     async fn reset_safety_stop(&self) -> Result<(), ControlError>;
     async fn status(&self) -> Result<MotionState, ControlError>;
+}
+
+/// Application query used by inbound adapters to display device health.
+pub trait DeviceHealthQuery: Send + Sync {
+    fn statuses(&self) -> Vec<(String, Health)>;
 }
